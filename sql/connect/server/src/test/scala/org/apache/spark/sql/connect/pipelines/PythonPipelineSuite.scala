@@ -404,6 +404,32 @@ class PythonPipelineSuite
         Set(graphIdentifier("b"), graphIdentifier("d")))
   }
 
+  test("referencing internal datasets that already exist in the catalog") {
+    val graph = buildGraph(
+      """
+        |from pyspark.sql import functions as F
+        |
+        |@dp.materialized_view
+        |def src():
+        |  return spark.range(5)
+        |
+        |@dp.materialized_view
+        |def a():
+        |  return spark.read.table("src").withColumn("y", F.col("id") + 1)
+        |
+        |@dp.materialized_view
+        |def c():
+        |  return spark.read.table("src").select("id")
+        |""".stripMargin,
+      // the precondition: `src` already exists, as it does on every run after the first
+      setupSql = Some("CREATE TABLE spark_catalog.default.src AS SELECT * FROM range(5)"))
+      .resolve(sessionCaseSensitive)
+      .validate(sessionCaseSensitive)
+
+    assert(graph.resolvedFlow(graphIdentifier("c")).inputs == Set(graphIdentifier("src")))
+    assert(graph.resolvedFlow(graphIdentifier("a")).inputs == Set(graphIdentifier("src")))
+  }
+
   test("referencing external datasets") {
     sql("CREATE TABLE spark_catalog.default.src AS SELECT * FROM RANGE(5)")
     val graph = buildGraph("""

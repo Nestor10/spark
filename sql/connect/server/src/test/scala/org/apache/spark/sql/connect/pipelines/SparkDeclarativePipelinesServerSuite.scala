@@ -1164,4 +1164,151 @@ class SparkDeclarativePipelinesServerSuite
           relation.getCommand.getSqlCommand.getInput)
     }
   }
+
+  // ===========================================================================
+  // SPARK-59663: dependency edges must be registered even when the upstream
+  // table already exists in the catalog.
+  // ===========================================================================
+
+  /** `spark.read.table(name)` -- the relation whose `UnresolvedRelation` carries the edge. */
+  private def readNamedTable(name: String): Relation =
+    Relation
+      .newBuilder()
+      .setRead(
+        proto.Read
+          .newBuilder()
+          .setNamedTable(proto.Read.NamedTable.newBuilder().setUnparsedIdentifier(name)))
+      .build()
+
+  private def unresolvedAttribute(name: String): Expression =
+    Expression
+      .newBuilder()
+      .setUnresolvedAttribute(
+        Expression.UnresolvedAttribute.newBuilder().setUnparsedIdentifier(name))
+      .build()
+
+  /** `upper(col(name))`. */
+  private def upperOf(name: String): Expression =
+    Expression
+      .newBuilder()
+      .setUnresolvedFunction(
+        Expression.UnresolvedFunction
+          .newBuilder()
+          .setFunctionName("upper")
+          .addArguments(unresolvedAttribute(name)))
+      .build()
+
+  /** `input.withColumn("y", upper(col("x")))` -- proto `WithColumns`. */
+  private def withColumnsOver(input: Relation): Relation =
+    Relation
+      .newBuilder()
+      .setWithColumns(
+        proto.WithColumns
+          .newBuilder()
+          .setInput(input)
+          .addAliases(Expression.Alias.newBuilder().addName("y").setExpr(upperOf("x"))))
+      .build()
+
+  /** `input.select(id, x, upper(col("x")) as "y")` -- proto `Project`, the control. */
+  private def projectOver(input: Relation): Relation =
+    Relation
+      .newBuilder()
+      .setProject(
+        proto.Project
+          .newBuilder()
+          .setInput(input)
+          .addExpressions(unresolvedAttribute("id"))
+          .addExpressions(unresolvedAttribute("x"))
+          .addExpressions(Expression
+            .newBuilder()
+            .setAlias(Expression.Alias.newBuilder().addName("y").setExpr(upperOf("x")))))
+      .build()
+
+  private val aQuery = "SELECT * FROM VALUES (1, 'north'), (2, 'south') AS t(id, x)"
+
+  /**
+   * A two dataset graph: `a`, with no inputs, and a downstream materialized view that reads `a`
+   * through `transform`. The only thing that varies between the withColumns case and the select
+   * control is which planner transform converts the downstream relation.
+   */
+  private def registerGraphReading(
+      graphId: String,
+      transform: Relation => Relation,
+      downstream: String)(implicit
+      stub: proto.SparkConnectServiceGrpc.SparkConnectServiceBlockingStub): Unit = {
+    val pipeline = new TestPipelineDefinition(graphId) {
+      createTable(name = "a", outputType = OutputType.MATERIALIZED_VIEW, sql = Some(aQuery))
+      createTable(
+        name = downstream,
+        outputType = OutputType.MATERIALIZED_VIEW,
+        query = Some(transform(readNamedTable("a"))))
+    }
+    registerPipelineOutputs(pipeline)
+  }
+
+  /** `(id, x)` of a table, ordered, so two tables can be compared directly. */
+  private def rowsOf(name: String): Seq[String] = {
+    spark.catalog.refreshTable(name)
+    spark
+      .table(name)
+      .select("id", "x")
+      .collect()
+      .map(r => s"${r.get(0)},${r.get(1)}")
+      .sorted
+      .toSeq
+  }
+
+  private def flowInputs(graphId: String, flowName: String): Set[String] =
+    getDefaultSessionHolder.dataflowGraphRegistry
+      .getDataflowGraphOrThrow(graphId)
+      .toDataflowGraph
+      .resolve(sessionCaseSensitive)
+      .resolvedFlows
+      .filter(_.identifier.unquotedString == s"spark_catalog.default.$flowName")
+      .head
+      .inputs
+      .map(_.unquotedString)
+
+  Seq(
+    ("withColumns", (r: Relation) => withColumnsOver(r), "b"),
+    ("select", (r: Relation) => projectOver(r), "c")).foreach {
+    case (label, transform, downstream) =>
+      test(
+        s"SPARK-59663: flow registers dependency on existing upstream table when using $label") {
+        withRawBlockingStub { implicit stub =>
+          // The precondition: `a` is already in the catalog, exactly as it is on every run
+          // after the first. Nothing else about the graph changes.
+          sql(s"CREATE TABLE spark_catalog.default.a AS $aQuery")
+
+          val graphId = createDataflowGraph
+          registerGraphReading(graphId, transform, downstream)
+
+          assert(flowInputs(graphId, "a") == Set.empty[String])
+          assert(flowInputs(graphId, downstream) == Set("spark_catalog.default.a"))
+        }
+      }
+
+      test(s"SPARK-59663: flow using $label is ordered after its upstream table on a re-run") {
+        withRawBlockingStub { implicit stub =>
+          val downstreamTable = s"spark_catalog.default.$downstream"
+
+          // Run 1 starts from an empty catalog, the only state the other suites exercise --
+          // and the state in which this bug is invisible.
+          val firstGraphId = createDataflowGraph
+          registerGraphReading(firstGraphId, transform, downstream)
+          startPipelineAndWaitForCompletion(firstGraphId)
+          assert(rowsOf(downstreamTable).size == 2)
+
+          // Run 2 registers the identical definitions while both tables exist. The downstream
+          // flow must still depend on `a`, or it is scheduled concurrently with its own
+          // upstream and reads the table the DatasetManager has just truncated.
+          val secondGraphId = createDataflowGraph
+          registerGraphReading(secondGraphId, transform, downstream)
+          assert(flowInputs(secondGraphId, downstream) == Set("spark_catalog.default.a"))
+
+          startPipelineAndWaitForCompletion(secondGraphId)
+          assert(rowsOf(downstreamTable) == rowsOf("spark_catalog.default.a"))
+        }
+      }
+  }
 }

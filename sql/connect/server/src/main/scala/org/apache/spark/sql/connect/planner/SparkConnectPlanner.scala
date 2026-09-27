@@ -87,6 +87,50 @@ import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
+private[connect] sealed trait PlanningMode
+
+private[connect] object PlanningMode {
+
+  /**
+   * The relation is a QUERY: it will be executed against the catalog as it is right now.
+   *
+   * The planner is free to analyze eagerly. This is the default.
+   */
+  case object Query extends PlanningMode
+
+  /**
+   * The relation is a DEFINITION: it defines a dataset, and the consumer - not the planner -
+   * decides what its inputs resolve to and when.
+   *
+   * The inputs named in the relation may not exist in the catalog yet. The planner therefore MUST
+   * produce a plan that does not depend on the state of the catalog: no eager analysis, and no
+   * resolution of an `UnresolvedRelation` that the consumer still has to interpret.
+   *
+   * Declarative Pipelines is the consumer.
+   */
+  case object Definition extends PlanningMode
+
+  /**
+   * The mode a request is to be planned in, decided once from the request itself.
+   */
+  def forRequest(request: proto.ExecutePlanRequest): PlanningMode = {
+    val isPipelineCommand = request.getPlan.hasCommand &&
+      request.getPlan.getCommand.getCommandTypeCase ==
+      proto.Command.CommandTypeCase.PIPELINE_COMMAND
+    if (isPipelineCommand) Definition else Query
+  }
+
+  /**
+   * The mode for a planner serving `holder`.
+   *
+   * A planner with no [[ExecuteHolder]] is not serving a request at all - the analyze handler,
+   * the ML handlers and the test utilities construct one from a `SessionHolder` alone - and plans
+   * queries.
+   */
+  def forHolder(holder: Option[ExecuteHolder]): PlanningMode =
+    holder.map(h => forRequest(h.request)).getOrElse(Query)
+}
+
 class SparkConnectPlanner(
     val sessionHolder: SessionHolder,
     val executeHolderOpt: Option[ExecuteHolder] = None)
@@ -118,6 +162,23 @@ class SparkConnectPlanner(
   private lazy val pythonExec =
     sys.env.getOrElse("PYSPARK_PYTHON", sys.env.getOrElse("PYSPARK_DRIVER_PYTHON", "python3"))
 
+  private[connect] val planningMode: PlanningMode = PlanningMode.forHolder(executeHolderOpt)
+
+  /**
+   * Converts `rel` through the session's plan cache, when this planner is allowed to use it.
+   *
+   * Only a [[PlanningMode.Query]] planner is: the cache is keyed by the proto relation and holds
+   * plans already resolved against the catalog, so a definition must neither read from it nor
+   * write to it. See [[PlanningMode.Definition]].
+   */
+
+  private def maybeCached(rel: proto.Relation, cachePlan: Boolean)(
+      transform: proto.Relation => LogicalPlan): LogicalPlan =
+    planningMode match {
+      case PlanningMode.Query => sessionHolder.usePlanCache(rel, cachePlan)(transform)
+      case PlanningMode.Definition => transform(rel)
+    }
+
   /**
    * The root of the query plan is a relation and we apply the transformations to it. The resolved
    * logical plan will not get cached. If the result needs to be cached, use
@@ -143,7 +204,7 @@ class SparkConnectPlanner(
    */
   @DeveloperApi
   def transformRelation(rel: proto.Relation, cachePlan: Boolean): LogicalPlan = {
-    val plan = sessionHolder.usePlanCache(rel, cachePlan) { rel =>
+    val plan = maybeCached(rel, cachePlan) { rel =>
       val plan = rel.getRelTypeCase match {
         // DataFrame API
         case proto.Relation.RelTypeCase.SHOW_STRING => transformShowString(rel.getShowString)
@@ -1287,6 +1348,16 @@ class SparkConnectPlanner(
       .logicalPlan
   }
 
+  // Applies `eager` or keeps `unresolved`, according to what this planner is converting for.
+  private def analyzedEagerlyIfQuery(unresolved: => LogicalPlan)(
+      eager: => LogicalPlan): LogicalPlan =
+    planningMode match {
+      case PlanningMode.Definition => unresolved
+      case PlanningMode.Query =>
+        try eager
+        catch { case _: AnalysisException | _: SparkException => unresolved }
+    }
+
   private def transformWithColumnsRenamed(rel: proto.WithColumnsRenamed): LogicalPlan = {
     val (colNames, newColNames) = if (rel.getRenamesCount > 0) {
       rel.getRenamesList.asScala.toSeq.map { rename =>
@@ -1298,17 +1369,10 @@ class SparkConnectPlanner(
     }
 
     val child = transformRelation(rel.getInput)
-    try {
-      // Try the eager analysis first.
-      Dataset
-        .ofRows(session, child)
-        .withColumnsRenamed(colNames, newColNames)
-        .logicalPlan
-    } catch {
-      case _: AnalysisException | _: SparkException =>
-        Project(
-          Seq(UnresolvedStarWithColumnsRenames(existingNames = colNames, newNames = newColNames)),
-          child)
+    analyzedEagerlyIfQuery(unresolved = Project(
+      Seq(UnresolvedStarWithColumnsRenames(existingNames = colNames, newNames = newColNames)),
+      child)) {
+      Dataset.ofRows(session, child).withColumnsRenamed(colNames, newColNames).logicalPlan
     }
   }
 
@@ -1329,21 +1393,17 @@ class SparkConnectPlanner(
       }.unzip3
 
     val child = transformRelation(rel.getInput)
-    try {
-      // Try the eager analysis first.
+    analyzedEagerlyIfQuery(unresolved = Project(
+      Seq(
+        UnresolvedStarWithColumns(
+          colNames = colNames,
+          exprs = exprs,
+          explicitMetadata = Some(metadata))),
+      child)) {
       Dataset
         .ofRows(session, child)
         .withColumns(colNames, exprs.map(expr => Column(expr)), metadata)
         .logicalPlan
-    } catch {
-      case _: AnalysisException | _: SparkException =>
-        Project(
-          Seq(
-            UnresolvedStarWithColumns(
-              colNames = colNames,
-              exprs = exprs,
-              explicitMetadata = Some(metadata))),
-          child)
     }
   }
 

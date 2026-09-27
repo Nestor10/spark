@@ -26,7 +26,7 @@ import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.Expression.{Alias, ExpressionString, UnresolvedStar}
 import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedAlias, UnresolvedFunction, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedAlias, UnresolvedFunction, UnresolvedRelation, UnresolvedStarWithColumns, UnresolvedStarWithColumnsRenames}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan}
@@ -36,6 +36,7 @@ import org.apache.spark.sql.classic.Dataset
 import org.apache.spark.sql.connect.SparkConnectTestUtils
 import org.apache.spark.sql.connect.common.InvalidPlanInput
 import org.apache.spark.sql.connect.common.LiteralValueProtoConverter.toLiteralProto
+import org.apache.spark.sql.connect.service.SessionHolder
 import org.apache.spark.sql.execution.arrow.ArrowConverters
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
@@ -1172,4 +1173,162 @@ class SparkConnectPlannerSuite extends SparkFunSuite with SparkConnectPlanTest {
       intercepted.getMessage.contains("No handler found for extension type: " +
         "type.googleapis.com/google.protobuf.StringValue"))
   }
+
+  test("SPARK-59663: definition mode leaves reads of existing tables unresolved") {
+    withTable("t_a") {
+      sql("CREATE TABLE t_a AS SELECT * FROM VALUES (1, 'north') AS t(id, x)")
+
+      val withColumns = proto.Relation
+        .newBuilder()
+        .setWithColumns(
+          proto.WithColumns
+            .newBuilder()
+            .setInput(namedTableRelation("t_a"))
+            .addAliases(Alias
+              .newBuilder()
+              .addName("y")
+              .setExpr(unresolvedAttributeExpr("x"))))
+        .build()
+
+      // Planned as a QUERY the table exists, so the eager analysis succeeds and the
+      // UnresolvedRelation that Declarative Pipelines relies on is gone.
+      val eager = transform(withColumns)
+      assert(!eager.exists(_.isInstanceOf[UnresolvedRelation]))
+      assert(!eager.expressions.exists(_.isInstanceOf[UnresolvedStarWithColumns]))
+
+      // Planned as a DEFINITION the read stays unresolved and the unresolved star form is used.
+      val definition = transformAsDefinition(withColumns)
+      assert(definition.exists(_.isInstanceOf[UnresolvedRelation]))
+      assert(definition.expressions.exists(_.isInstanceOf[UnresolvedStarWithColumns]))
+    }
+  }
+
+  test(
+    "SPARK-59663: definition mode leaves reads of existing tables unresolved for " +
+      "withColumnsRenamed") {
+    withTable("t_a") {
+      sql("CREATE TABLE t_a AS SELECT * FROM VALUES (1, 'north') AS t(id, x)")
+
+      val withColumnsRenamed = proto.Relation
+        .newBuilder()
+        .setWithColumnsRenamed(
+          proto.WithColumnsRenamed
+            .newBuilder()
+            .setInput(namedTableRelation("t_a"))
+            .addRenames(proto.WithColumnsRenamed.Rename
+              .newBuilder()
+              .setColName("x")
+              .setNewColName("y")))
+        .build()
+
+      val eager = transform(withColumnsRenamed)
+      assert(!eager.exists(_.isInstanceOf[UnresolvedRelation]))
+      assert(!eager.expressions.exists(_.isInstanceOf[UnresolvedStarWithColumnsRenames]))
+
+      val definition = transformAsDefinition(withColumnsRenamed)
+      assert(definition.exists(_.isInstanceOf[UnresolvedRelation]))
+      assert(definition.expressions.exists(_.isInstanceOf[UnresolvedStarWithColumnsRenames]))
+    }
+  }
+
+  private def namedTableRelation(name: String): proto.Relation =
+    proto.Relation
+      .newBuilder()
+      .setRead(
+        proto.Read
+          .newBuilder()
+          .setNamedTable(proto.Read.NamedTable.newBuilder().setUnparsedIdentifier(name)))
+      .build()
+
+  private def unresolvedAttributeExpr(name: String): proto.Expression =
+    proto.Expression
+      .newBuilder()
+      .setUnresolvedAttribute(
+        proto.Expression.UnresolvedAttribute.newBuilder().setUnparsedIdentifier(name))
+      .build()
+
+  test("SPARK-59663: PlanningMode is derived from the request") {
+    def requestFor(plan: proto.Plan): proto.ExecutePlanRequest =
+      proto.ExecutePlanRequest.newBuilder().setPlan(plan).build()
+
+    val pipelineCommand = proto.Plan
+      .newBuilder()
+      .setCommand(
+        proto.Command
+          .newBuilder()
+          .setPipelineCommand(proto.PipelineCommand.newBuilder().build()))
+      .build()
+    assert(PlanningMode.forRequest(requestFor(pipelineCommand)) == PlanningMode.Definition)
+
+    // Everything else is a query: a plan root, and any other command.
+    val root = proto.Plan.newBuilder().setRoot(readRel).build()
+    assert(PlanningMode.forRequest(requestFor(root)) == PlanningMode.Query)
+
+    val otherCommand = proto.Plan
+      .newBuilder()
+      .setCommand(
+        proto.Command
+          .newBuilder()
+          .setSqlCommand(proto.SqlCommand.newBuilder().build()))
+      .build()
+    assert(PlanningMode.forRequest(requestFor(otherCommand)) == PlanningMode.Query)
+  }
+
+  test("SPARK-59663: a planner built from a pipeline command request is in definition mode") {
+    val sessionHolder = SparkConnectTestUtils.createDummySessionHolder(spark)
+    assert(definitionPlanner(sessionHolder).planningMode == PlanningMode.Definition)
+
+    val sqlCommand = proto.Command
+      .newBuilder()
+      .setSqlCommand(proto.SqlCommand.newBuilder().build())
+      .build()
+    val queryHolder = SparkConnectTestUtils.createDummyExecuteHolder(sessionHolder, sqlCommand)
+    assert(new SparkConnectPlanner(queryHolder).planningMode == PlanningMode.Query)
+  }
+
+  test("SPARK-59663: definition mode does not serve a cached query-mode plan") {
+    withTable("t_a") {
+      sql("CREATE TABLE t_a AS SELECT * FROM VALUES (1, 'north') AS t(id, x)")
+
+      // A plan id is what makes a relation cacheable at all, so the relation the client would
+      // send for `df.schema` and then re-send inside DefineFlow carries one.
+      val withColumns = proto.Relation
+        .newBuilder()
+        .setCommon(proto.RelationCommon.newBuilder().setPlanId(4242))
+        .setWithColumns(
+          proto.WithColumns
+            .newBuilder()
+            .setInput(namedTableRelation("t_a"))
+            .addAliases(Alias.newBuilder().addName("y").setExpr(unresolvedAttributeExpr("x"))))
+        .build()
+
+      // One session, as a real client would have: both planners share its plan cache.
+      val sessionHolder = SparkConnectTestUtils.createDummySessionHolder(spark)
+
+      // An AnalyzePlan of the same relation caches the eagerly analyzed, fully resolved plan --
+      // this mirrors how SparkConnectAnalyzeHandler converts (cachePlan = true).
+      val cached =
+        new SparkConnectPlanner(sessionHolder).transformRelation(withColumns, cachePlan = true)
+      assert(!cached.exists(_.isInstanceOf[UnresolvedRelation]))
+
+      // Registering the identical relation as a definition must NOT pick that plan back up.
+      val definition = definitionPlanner(sessionHolder).transformRelation(withColumns)
+      assert(definition.exists(_.isInstanceOf[UnresolvedRelation]))
+      assert(definition.expressions.exists(_.isInstanceOf[UnresolvedStarWithColumns]))
+    }
+  }
+
+  /** The command a pipeline client sends, which is what puts a planner in definition mode. */
+  private def pipelineCommand: proto.Command =
+    proto.Command.newBuilder().setPipelineCommand(proto.PipelineCommand.newBuilder()).build()
+
+  /** A planner serving a pipeline command, exactly as the server builds one. */
+  private def definitionPlanner(sessionHolder: SessionHolder): SparkConnectPlanner =
+    new SparkConnectPlanner(
+      SparkConnectTestUtils.createDummyExecuteHolder(sessionHolder, pipelineCommand))
+
+  /** Converts `rel` the way a pipeline flow relation is converted. */
+  private def transformAsDefinition(rel: proto.Relation): logical.LogicalPlan =
+    definitionPlanner(SparkConnectTestUtils.createDummySessionHolder(spark))
+      .transformRelation(rel)
 }
